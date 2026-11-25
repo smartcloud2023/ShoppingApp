@@ -1,9 +1,0 @@
-environment: staging
-
-defaults:
-  replicas: 2
-  pdb:
-    enabled: true
-
-ingress:
-  host: shop.staging.example.com
