@@ -1,0 +1,85 @@
+name: Build and push to ECR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write   # lets the job get short-lived AWS credentials via OIDC
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  REPO_PREFIX: ${{ vars.ECR_REPO_PREFIX || 'ecomerce' }}
+
+jobs:
+  build:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - { service: accounting,      dockerfile: src/accounting/Dockerfile }
+          - { service: ad,              dockerfile: src/ad/Dockerfile }
+          - { service: agent,           dockerfile: src/agent/Dockerfile }
+          - { service: cart,            dockerfile: src/cart/src/Dockerfile }
+          - { service: chatbot,         dockerfile: src/chatbot/Dockerfile }
+          - { service: checkout,        dockerfile: src/checkout/Dockerfile }
+          - { service: currency,        dockerfile: src/currency/Dockerfile }
+          - { service: email,           dockerfile: src/email/Dockerfile }
+          - { service: flagd-ui,        dockerfile: src/flagd-ui/Dockerfile }
+          - { service: fraud-detection, dockerfile: src/fraud-detection/Dockerfile }
+          - { service: frontend,        dockerfile: src/frontend/Dockerfile }
+          - { service: frontend-proxy,  dockerfile: src/frontend-proxy/Dockerfile }
+          - { service: image-provider,  dockerfile: src/image-provider/Dockerfile }
+          - { service: kafka,           dockerfile: src/kafka/Dockerfile }
+          - { service: load-generator,  dockerfile: src/load-generator/Dockerfile }
+          - { service: mcp,             dockerfile: src/mcp/Dockerfile }
+          - { service: opamp-server,    dockerfile: src/opamp-server/Dockerfile }
+          - { service: opensearch,      dockerfile: src/opensearch/Dockerfile }
+          - { service: payment,         dockerfile: src/payment/Dockerfile }
+          - { service: product-catalog, dockerfile: src/product-catalog/Dockerfile }
+          - { service: quote,           dockerfile: src/quote/Dockerfile }
+          - { service: recommendation,  dockerfile: src/recommendation/Dockerfile }
+          - { service: shipping,        dockerfile: src/shipping/Dockerfile }
+          - { service: telemetry-docs,  dockerfile: src/telemetry-docs/Dockerfile }
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v7
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repo (if missing)
+        run: |
+          REPO=$REPO_PREFIX/${{ matrix.service }}
+          aws ecr describe-repositories --repository-names $REPO || aws ecr create-repository --repository-name $REPO
+          echo "IMAGE=${{ steps.ecr.outputs.registry }}/$REPO" >> $GITHUB_ENV
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          build-args: |
+            OTEL_JAVA_AGENT_VERSION=2.31.1
+            OPENTELEMETRY_CPP_VERSION=1.28.0
+            OPAMP_GO_REF=40c117bcec97130c236fc4b9aabc3a1a5e514c50
