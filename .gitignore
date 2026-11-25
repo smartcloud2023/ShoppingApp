@@ -67,3 +67,4 @@ replay_pid*.log
 reports/
 *.sarif
 sbom-*.cdx.json
+.gitignore

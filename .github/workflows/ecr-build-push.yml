@@ -50,6 +50,8 @@ jobs:
     steps:
       - name: Get the code
         uses: actions/checkout@v7
+      - name: Show repo ID
+        run: echo "Repo ID is ${{ github.repository_id }}"
 
       - name: Log in to AWS
         uses: aws-actions/configure-aws-credentials@v6
