@@ -16,8 +16,7 @@ env:
 jobs:
 
  sast:                                                                  # line 71
-    name: 3. SAST (SonarCloud)
-    needs: dockerfile-lint            # runs after step 2
+    name: 3. SAST (SonarCloud)          # runs after step 2
     runs-on: ubuntu-latest
     steps:
       - name: Get the code (full history, Sonar needs it)
