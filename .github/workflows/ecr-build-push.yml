@@ -14,6 +14,35 @@ env:
   REPO_PREFIX: ${{ vars.ECR_REPO_PREFIX || 'ecomerce' }}
 
 jobs:
+
+ sast:                                                                  # line 71
+    name: 3. SAST (SonarCloud)
+    needs: dockerfile-lint            # runs after step 2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code (full history, Sonar needs it)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Empty folder for Java classes
+        run: mkdir -p .sonar-no-binaries
+
+      - name: Run SonarCloud scan                                        # line 86
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}                        # your secret
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}          # smartcloud2023
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}             # smartcloud2023_ShoppingApp
+            -Dsonar.sources=src
+            -Dsonar.exclusions=**/node_modules/**,**/vendor/**,**/*_pb2*.py,**/*.pb.go,**/genproto/**
+            -Dsonar.java.binaries=.sonar-no-binaries
+            -Dsonar.qualitygate.wait=true     
+
+            
   build:
     name: ${{ matrix.service }}
     runs-on: ubuntu-latest
@@ -58,6 +87,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
+          
 
       - name: Log in to ECR
         id: ecr
@@ -68,6 +98,8 @@ jobs:
           REPO=$REPO_PREFIX/${{ matrix.service }}
           aws ecr describe-repositories --repository-names $REPO || aws ecr create-repository --repository-name $REPO
           echo "IMAGE=${{ steps.ecr.outputs.registry }}/$REPO" >> $GITHUB_ENV
+
+
 
       - name: Set up Docker
         uses: docker/setup-buildx-action@v4

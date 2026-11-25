@@ -1,0 +1,234 @@
+# ---------------------------------------------------------------------------
+# E-commerce pipeline: check the code, then build and push images to ECR.
+#
+# The jobs run one after the other. If any check fails, the pipeline stops
+# and nothing gets built or pushed:
+#
+#   1. Secrets scan       - no passwords or keys in the code   (Gitleaks)
+#   2. Dockerfile lint    - Dockerfiles follow good practice    (Hadolint)
+#   3. SAST               - bugs and security flaws in our code (SonarCloud)
+#   4. Dependency check   - known-vulnerable libraries          (OWASP Dependency-Check)
+#   5. Misconfig scan     - risky settings in Dockerfiles       (Trivy)
+#   6. Build and push     - only on main, only if 1-5 passed
+#
+# Pull requests run checks 1-5 only. Nothing is pushed from a PR.
+#
+# GitHub settings needed (Settings -> Secrets and variables -> Actions):
+#   Secrets:   AWS_OIDC_ARN, SONAR_TOKEN, NVD_API_KEY (optional, makes step 4 faster)
+#   Variables: AWS_REGION, SONAR_ORGANIZATION, SONAR_PROJECT_KEY
+# ---------------------------------------------------------------------------
+name: Check, build and push to ECR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-west-1' }}
+  REPO_PREFIX: ${{ vars.ECR_REPO_PREFIX || 'ecomerce' }}
+
+jobs:
+
+  # 1. Look through the code AND its git history for leaked passwords/keys.
+  secrets-scan:
+    name: 1. Secrets scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code (full history)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 \
+            detect --source /repo --redact --verbose
+
+  # 2. Check every Dockerfile for common mistakes (running as root,
+  #    unpinned packages, using "latest" base images, ...).
+  dockerfile-lint:
+    name: 2. Dockerfile lint
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v7
+
+      - name: Run Hadolint on all Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          failure-threshold: error   # warnings are shown, only errors fail
+
+  # 3. Static analysis of our own code. The quality gate on SonarCloud
+  #    decides pass/fail, and this job waits for that answer.
+  sast:
+    name: 3. SAST (SonarCloud)
+    needs: dockerfile-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code (full history, Sonar needs it)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Sonar wants compiled Java classes. We don't compile here, so give it
+      # an empty folder and it analyses the Java source on its own.
+      - name: Empty folder for Java classes
+        run: mkdir -p .sonar-no-binaries
+
+      - name: Run SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=src
+            -Dsonar.exclusions=**/node_modules/**,**/vendor/**,**/*_pb2*.py,**/*.pb.go,**/genproto/**
+            -Dsonar.java.binaries=.sonar-no-binaries
+            -Dsonar.qualitygate.wait=true
+
+  # 4. Compare every library we use against the public vulnerability
+  #    database (NVD). Fails if anything scores CVSS 7 or higher.
+  dependency-check:
+    name: 4. Dependency check (OWASP)
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v7
+
+      # The vulnerability database is big. Keeping it between runs saves
+      # 10+ minutes each time.
+      - name: Reuse the vulnerability database
+        uses: actions/cache@v4
+        with:
+          path: ~/.dependency-check
+          key: depcheck-${{ github.run_id }}
+          restore-keys: depcheck-
+
+      - name: Run OWASP Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          mkdir -p ~/.dependency-check reports
+          docker run --rm \
+            -e NVD_API_KEY \
+            -v "$PWD:/src:ro" \
+            -v ~/.dependency-check:/usr/share/dependency-check/data \
+            -v "$PWD/reports:/report" \
+            owasp/dependency-check:12.1.0 \
+              --scan /src/src \
+              --project ecommerce \
+              ${NVD_API_KEY:+--nvdApiKey "$NVD_API_KEY"} \
+              --exclude "**/node_modules/**" \
+              --format HTML \
+              --failOnCVSS 7 \
+              --out /report
+
+      - name: Save the report (download it from the run page)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  # 5. Look for risky settings in Dockerfiles (e.g. secrets in ENV,
+  #    no USER line, ADD from a URL).
+  misconfig-scan:
+    name: 5. Misconfig scan (Trivy)
+    needs: dependency-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v7
+
+      - name: Run Trivy config scan
+        run: |
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:0.76.2 \
+            config /repo --severity HIGH,CRITICAL --exit-code 1
+
+  # 6. Everything passed: build each service and push it to ECR.
+  build:
+    name: 6. Build ${{ matrix.service }}
+    needs: misconfig-scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # lets the job get short-lived AWS credentials via OIDC
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - { service: accounting,      dockerfile: src/accounting/Dockerfile }
+          - { service: ad,              dockerfile: src/ad/Dockerfile }
+          - { service: agent,           dockerfile: src/agent/Dockerfile }
+          - { service: cart,            dockerfile: src/cart/src/Dockerfile }
+          - { service: chatbot,         dockerfile: src/chatbot/Dockerfile }
+          - { service: checkout,        dockerfile: src/checkout/Dockerfile }
+          - { service: currency,        dockerfile: src/currency/Dockerfile }
+          - { service: email,           dockerfile: src/email/Dockerfile }
+          - { service: flagd-ui,        dockerfile: src/flagd-ui/Dockerfile }
+          - { service: fraud-detection, dockerfile: src/fraud-detection/Dockerfile }
+          - { service: frontend,        dockerfile: src/frontend/Dockerfile }
+          - { service: frontend-proxy,  dockerfile: src/frontend-proxy/Dockerfile }
+          - { service: image-provider,  dockerfile: src/image-provider/Dockerfile }
+          - { service: kafka,           dockerfile: src/kafka/Dockerfile }
+          - { service: load-generator,  dockerfile: src/load-generator/Dockerfile }
+          - { service: mcp,             dockerfile: src/mcp/Dockerfile }
+          - { service: opamp-server,    dockerfile: src/opamp-server/Dockerfile }
+          - { service: opensearch,      dockerfile: src/opensearch/Dockerfile }
+          - { service: payment,         dockerfile: src/payment/Dockerfile }
+          - { service: product-catalog, dockerfile: src/product-catalog/Dockerfile }
+          - { service: quote,           dockerfile: src/quote/Dockerfile }
+          - { service: recommendation,  dockerfile: src/recommendation/Dockerfile }
+          - { service: shipping,        dockerfile: src/shipping/Dockerfile }
+          - { service: telemetry-docs,  dockerfile: src/telemetry-docs/Dockerfile }
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v7
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repo (if missing)
+        run: |
+          REPO=$REPO_PREFIX/${{ matrix.service }}
+          aws ecr describe-repositories --repository-names $REPO || aws ecr create-repository --repository-name $REPO
+          echo "IMAGE=${{ steps.ecr.outputs.registry }}/$REPO" >> $GITHUB_ENV
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          build-args: |
+            OTEL_JAVA_AGENT_VERSION=2.31.1
+            OPENTELEMETRY_CPP_VERSION=1.28.0
+            OPAMP_GO_REF=40c117bcec97130c236fc4b9aabc3a1a5e514c50
