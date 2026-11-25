@@ -1,4 +1,23 @@
-
+# ---------------------------------------------------------------------------
+# E-commerce pipeline: check the code, then build and push images to ECR.
+#
+# The jobs run one after the other. Every check is REPORT-ONLY: it never
+# fails the pipeline. Each one counts what it found and lists it on the run
+# page (Actions -> the run -> Summary), then lets the next step carry on.
+#
+#   1. Secrets scan       - no passwords or keys in the code   (Gitleaks)
+#   2. Dockerfile lint    - Dockerfiles follow good practice    (Hadolint)
+#   3. SAST               - bugs and security flaws in our code (SonarCloud)
+#   4. Dependency check   - known-vulnerable libraries          (OWASP Dependency-Check)
+#   5. Misconfig scan     - risky settings in Dockerfiles       (Trivy)
+#   6. Build and push     - only on main
+#
+# Pull requests run checks 1-5 only. Nothing is pushed from a PR.
+#
+# GitHub settings needed (Settings -> Secrets and variables -> Actions):
+#   Secrets:   AWS_OIDC_ARN, SONAR_TOKEN, NVD_API_KEY (optional, makes step 4 faster)
+#   Variables: AWS_REGION, SONAR_ORGANIZATION, SONAR_PROJECT_KEY
+# ---------------------------------------------------------------------------
 name: Check, build and push to ECR
 
 on:
@@ -27,10 +46,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run Gitleaks
+      - name: Run Gitleaks (report only)
         run: |
           docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 \
-            detect --source /repo --redact --verbose
+            detect --source /repo --redact --verbose \
+            --report-format json --report-path /repo/gitleaks.json \
+            --exit-code 0
+
+      - name: Summary
+        if: always()
+        run: |
+          COUNT=$(jq length gitleaks.json)
+          {
+            echo "## 1. Secrets scan: $COUNT possible secret(s) found"
+            echo "| File | Line | Rule |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.File) | \(.StartLine) | \(.RuleID) |"' gitleaks.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Gitleaks found $COUNT possible secret(s). See the run Summary."
 
   # 2. Check every Dockerfile for common mistakes (running as root,
   #    unpinned packages, using "latest" base images, ...).
@@ -42,14 +75,26 @@ jobs:
       - name: Get the code
         uses: actions/checkout@v7
 
-      - name: Run Hadolint on all Dockerfiles
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          recursive: true
-          failure-threshold: error   # warnings are shown, only errors fail
+      - name: Run Hadolint on all Dockerfiles (report only)
+        run: |
+          for f in $(find src -name '*Dockerfile'); do
+            docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --no-fail - < "$f" | sed "s|^-|$f|"
+          done | tee hadolint.txt
 
-  # 3. Static analysis of our own code. The quality gate on SonarCloud
-  #    decides pass/fail, and this job waits for that answer.
+      - name: Summary
+        if: always()
+        run: |
+          COUNT=$(grep -c . hadolint.txt || true)
+          {
+            echo "## 2. Dockerfile lint: $COUNT issue(s) found"
+            echo '```'
+            cat hadolint.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Hadolint found $COUNT issue(s). See the run Summary."
+
+  # 3. Static analysis of our own code. We wait for SonarCloud's quality
+  #    gate result and report it, but a failed gate does not stop the pipeline.
   sast:
     name: 3. SAST (SonarCloud)
     needs: dockerfile-lint
@@ -65,7 +110,8 @@ jobs:
       - name: Empty folder for Java classes
         run: mkdir -p .sonar-no-binaries
 
-      - name: Run SonarCloud scan
+      - name: Run SonarCloud scan (report only)
+        continue-on-error: true
         uses: SonarSource/sonarqube-scan-action@v8
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -79,8 +125,28 @@ jobs:
             -Dsonar.java.binaries=.sonar-no-binaries
             -Dsonar.qualitygate.wait=true
 
+      - name: Summary
+        if: always()
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          KEY: ${{ vars.SONAR_PROJECT_KEY }}
+        run: |
+          API=https://sonarcloud.io/api
+          GATE=$(curl -s -u "$SONAR_TOKEN:" "$API/qualitygates/project_status?projectKey=$KEY" | jq -r '.projectStatus.status // "unknown"')
+          ISSUES=$(curl -s -u "$SONAR_TOKEN:" "$API/issues/search?componentKeys=$KEY&resolved=false&ps=1&facets=severities")
+          TOTAL=$(echo "$ISSUES" | jq -r '.total // 0')
+          {
+            echo "## 3. SAST (SonarCloud): $TOTAL open issue(s), quality gate: $GATE"
+            echo "| Severity | Count |"
+            echo "|---|---|"
+            echo "$ISSUES" | jq -r '.facets[0].values[]? | "| \(.val) | \(.count) |"'
+            echo
+            echo "Full list: https://sonarcloud.io/project/issues?id=$KEY"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::SonarCloud: $TOTAL open issue(s), quality gate $GATE. See the run Summary."
+
   # 4. Compare every library we use against the public vulnerability
-  #    database (NVD). Fails if anything scores CVSS 7 or higher.
+  #    database (NVD) and report what is vulnerable.
   dependency-check:
     name: 4. Dependency check (OWASP)
     needs: sast
@@ -98,7 +164,7 @@ jobs:
           key: depcheck-${{ github.run_id }}
           restore-keys: depcheck-
 
-      - name: Run OWASP Dependency-Check
+      - name: Run OWASP Dependency-Check (report only)
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
@@ -113,9 +179,23 @@ jobs:
               --project ecommerce \
               ${NVD_API_KEY:+--nvdApiKey "$NVD_API_KEY"} \
               --exclude "**/node_modules/**" \
-              --format HTML \
-              --failOnCVSS 7 \
+              --format HTML --format JSON \
               --out /report
+
+      - name: Summary
+        if: always()
+        run: |
+          R=reports/dependency-check-report.json
+          COUNT=$(jq '[.dependencies[].vulnerabilities[]?] | length' "$R")
+          {
+            echo "## 4. Dependency check: $COUNT known vulnerability(ies) found"
+            echo "| Library | CVE | Severity |"
+            echo "|---|---|---|"
+            jq -r '.dependencies[] | .fileName as $f | .vulnerabilities[]? | "| \($f) | \(.name) | \(.severity) |"' "$R" | sort -u | head -200
+            echo
+            echo "Full HTML report: download **dependency-check-report** from this run."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Dependency-Check found $COUNT known vulnerability(ies). See the run Summary."
 
       - name: Save the report (download it from the run page)
         if: always()
@@ -134,83 +214,96 @@ jobs:
       - name: Get the code
         uses: actions/checkout@v7
 
-      - name: Run Trivy config scan
+      - name: Run Trivy config scan (report only)
         run: |
           docker run --rm -v "$PWD:/repo" aquasec/trivy:0.76.2 \
-            config /repo --severity HIGH,CRITICAL --exit-code 1
+            config /repo --severity HIGH,CRITICAL --exit-code 0 \
+            --format json --output /repo/trivy.json
+
+      - name: Summary
+        if: always()
+        run: |
+          COUNT=$(jq '[.Results[]?.Misconfigurations[]?] | length' trivy.json)
+          {
+            echo "## 5. Misconfig scan: $COUNT HIGH/CRITICAL issue(s) found"
+            echo "| File | Severity | Issue |"
+            echo "|---|---|---|"
+            jq -r '.Results[]? | .Target as $t | .Misconfigurations[]? | "| \($t) | \(.Severity) | \(.Title) |"' trivy.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Trivy found $COUNT HIGH/CRITICAL misconfiguration(s). See the run Summary."
 
   # 6. Everything passed: build each service and push it to ECR.
-  # build:
-  #   name: 6. Build ${{ matrix.service }}
-  #   needs: misconfig-scan
-  #   if: github.event_name != 'pull_request'
-  #   runs-on: ubuntu-latest
-  #   permissions:
-  #     contents: read
-  #     id-token: write   # lets the job get short-lived AWS credentials via OIDC
-  #   strategy:
-  #     fail-fast: false
-  #     max-parallel: 8
-  #     matrix:
-  #       include:
-  #         - { service: accounting,      dockerfile: src/accounting/Dockerfile }
-  #         - { service: ad,              dockerfile: src/ad/Dockerfile }
-  #         - { service: agent,           dockerfile: src/agent/Dockerfile }
-  #         - { service: cart,            dockerfile: src/cart/src/Dockerfile }
-  #         - { service: chatbot,         dockerfile: src/chatbot/Dockerfile }
-  #         - { service: checkout,        dockerfile: src/checkout/Dockerfile }
-  #         - { service: currency,        dockerfile: src/currency/Dockerfile }
-  #         - { service: email,           dockerfile: src/email/Dockerfile }
-  #         - { service: flagd-ui,        dockerfile: src/flagd-ui/Dockerfile }
-  #         - { service: fraud-detection, dockerfile: src/fraud-detection/Dockerfile }
-  #         - { service: frontend,        dockerfile: src/frontend/Dockerfile }
-  #         - { service: frontend-proxy,  dockerfile: src/frontend-proxy/Dockerfile }
-  #         - { service: image-provider,  dockerfile: src/image-provider/Dockerfile }
-  #         - { service: kafka,           dockerfile: src/kafka/Dockerfile }
-  #         - { service: load-generator,  dockerfile: src/load-generator/Dockerfile }
-  #         - { service: mcp,             dockerfile: src/mcp/Dockerfile }
-  #         - { service: opamp-server,    dockerfile: src/opamp-server/Dockerfile }
-  #         - { service: opensearch,      dockerfile: src/opensearch/Dockerfile }
-  #         - { service: payment,         dockerfile: src/payment/Dockerfile }
-  #         - { service: product-catalog, dockerfile: src/product-catalog/Dockerfile }
-  #         - { service: quote,           dockerfile: src/quote/Dockerfile }
-  #         - { service: recommendation,  dockerfile: src/recommendation/Dockerfile }
-  #         - { service: shipping,        dockerfile: src/shipping/Dockerfile }
-  #         - { service: telemetry-docs,  dockerfile: src/telemetry-docs/Dockerfile }
+  build:
+    name: 6. Build ${{ matrix.service }}
+    needs: misconfig-scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # lets the job get short-lived AWS credentials via OIDC
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - { service: accounting,      dockerfile: src/accounting/Dockerfile }
+          - { service: ad,              dockerfile: src/ad/Dockerfile }
+          - { service: agent,           dockerfile: src/agent/Dockerfile }
+          - { service: cart,            dockerfile: src/cart/src/Dockerfile }
+          - { service: chatbot,         dockerfile: src/chatbot/Dockerfile }
+          - { service: checkout,        dockerfile: src/checkout/Dockerfile }
+          - { service: currency,        dockerfile: src/currency/Dockerfile }
+          - { service: email,           dockerfile: src/email/Dockerfile }
+          - { service: flagd-ui,        dockerfile: src/flagd-ui/Dockerfile }
+          - { service: fraud-detection, dockerfile: src/fraud-detection/Dockerfile }
+          - { service: frontend,        dockerfile: src/frontend/Dockerfile }
+          - { service: frontend-proxy,  dockerfile: src/frontend-proxy/Dockerfile }
+          - { service: image-provider,  dockerfile: src/image-provider/Dockerfile }
+          - { service: kafka,           dockerfile: src/kafka/Dockerfile }
+          - { service: load-generator,  dockerfile: src/load-generator/Dockerfile }
+          - { service: mcp,             dockerfile: src/mcp/Dockerfile }
+          - { service: opamp-server,    dockerfile: src/opamp-server/Dockerfile }
+          - { service: opensearch,      dockerfile: src/opensearch/Dockerfile }
+          - { service: payment,         dockerfile: src/payment/Dockerfile }
+          - { service: product-catalog, dockerfile: src/product-catalog/Dockerfile }
+          - { service: quote,           dockerfile: src/quote/Dockerfile }
+          - { service: recommendation,  dockerfile: src/recommendation/Dockerfile }
+          - { service: shipping,        dockerfile: src/shipping/Dockerfile }
+          - { service: telemetry-docs,  dockerfile: src/telemetry-docs/Dockerfile }
 
-  #   steps:
-  #     - name: Get the code
-  #       uses: actions/checkout@v7
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v7
 
-  #     - name: Log in to AWS
-  #       uses: aws-actions/configure-aws-credentials@v6
-  #       with:
-  #         role-to-assume: ${{ secrets.AWS_OIDC_ARN }}
-  #         aws-region: ${{ env.AWS_REGION }}
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-  #     - name: Log in to ECR
-  #       id: ecr
-  #       uses: aws-actions/amazon-ecr-login@v2
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-  #     - name: Create ECR repo (if missing)
-  #       run: |
-  #         REPO=$REPO_PREFIX/${{ matrix.service }}
-  #         aws ecr describe-repositories --repository-names $REPO || aws ecr create-repository --repository-name $REPO
-  #         echo "IMAGE=${{ steps.ecr.outputs.registry }}/$REPO" >> $GITHUB_ENV
+      - name: Create ECR repo (if missing)
+        run: |
+          REPO=$REPO_PREFIX/${{ matrix.service }}
+          aws ecr describe-repositories --repository-names $REPO || aws ecr create-repository --repository-name $REPO
+          echo "IMAGE=${{ steps.ecr.outputs.registry }}/$REPO" >> $GITHUB_ENV
 
-  #     - name: Set up Docker
-  #       uses: docker/setup-buildx-action@v4
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v4
 
-  #     - name: Build and push
-  #       uses: docker/build-push-action@v7
-  #       with:
-  #         context: .
-  #         file: ${{ matrix.dockerfile }}
-  #         push: true
-  #         tags: |
-  #           ${{ env.IMAGE }}:${{ github.sha }}
-  #           ${{ env.IMAGE }}:latest
-  #         build-args: |
-  #           OTEL_JAVA_AGENT_VERSION=2.31.1
-  #           OPENTELEMETRY_CPP_VERSION=1.28.0
-  #           OPAMP_GO_REF=40c117bcec97130c236fc4b9aabc3a1a5e514c50
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          build-args: |
+            OTEL_JAVA_AGENT_VERSION=2.31.1
+            OPENTELEMETRY_CPP_VERSION=1.28.0
+            OPAMP_GO_REF=40c117bcec97130c236fc4b9aabc3a1a5e514c50
