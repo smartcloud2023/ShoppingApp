@@ -1,0 +1,13 @@
+apiVersion: v2
+name: ecommerce
+description: >
+  One chart for all the e-commerce microservices. Each service is an entry in
+  values.yaml; the templates loop over them. Secure by default: non-root,
+  read-only root filesystem, no privilege escalation, default-deny network
+  policy, secrets pulled from Vault by External Secrets.
+type: application
+version: 0.3.0
+appVersion: "2.1.0"
+kubeVersion: ">=1.29.0-0"
+maintainers:
+  - name: Platform team

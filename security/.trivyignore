@@ -1,0 +1,8 @@
+# Trivy ignore list. Same rules as the Dependency-Check suppressions:
+# a reason, an owner and an expiry on every line. Expired entries stop
+# being ignored automatically.
+#
+# Format: ID  exp:YYYY-MM-DD   # reason, owner, ticket
+
+# Example (remove when there is a real one):
+# CVE-2026-00000  exp:2027-01-31   # not reachable, only in test image layer. Smart. SEC-150

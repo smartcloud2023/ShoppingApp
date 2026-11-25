@@ -1,0 +1,31 @@
+# Shared Trivy settings for fs, config and image scans.
+# Severity and exit code are set per step in the workflow, so the same file
+# drives both the "report everything" pass and the "block on HIGH+" gate.
+timeout: 15m
+ignorefile: security/.trivyignore
+
+db:
+  # Mirror the vulnerability DB to ECR/your registry in an air-gapped setup:
+  # repository: <registry>/trivy-db
+  skip-update: false
+
+scan:
+  skip-dirs:
+    - "**/node_modules"
+    - "**/vendor"
+    - test/fixtures
+
+misconfiguration:
+  # Dockerfiles, Kubernetes manifests, the Helm chart and any Terraform.
+  scanners:
+    - dockerfile
+    - kubernetes
+    - helm
+    - terraform
+  helm:
+    values:
+      - charts/ecommerce/values.yaml
+      - charts/ecommerce/values-prod.yaml
+
+secret:
+  config: security/trivy-secret.yaml

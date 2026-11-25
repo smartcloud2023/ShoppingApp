@@ -1,0 +1,165 @@
+# Defaults shared by every environment. values-<env>.yaml only holds the
+# differences (replicas, resources, hostnames). The pipeline sets the image
+# registry and tag with --set, so no account IDs live in git.
+
+environment: ""        # set in values-<env>.yaml
+
+global:
+  image:
+    registry: ""          # set by CI: <account>.dkr.ecr.<region>.amazonaws.com/<prefix>
+    tag: ""               # set by CI: the git SHA
+    pullPolicy: IfNotPresent
+
+  # Applied to every pod unless a service overrides it.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+
+  otel:
+    endpoint: http://otel-collector:4317
+    serviceNamePrefix: ""
+
+  # Vault via External Secrets Operator. This replaces deployment/02-secrets.yaml,
+  # which had the secrets in plain text in git.
+  externalSecrets:
+    enabled: true
+    secretStore: vault-ecommerce        # a ClusterSecretStore using Vault k8s auth
+    refreshInterval: 1h
+
+  networkPolicy:
+    enabled: true
+    # Namespaces allowed to reach pods that set ingress: true
+    ingressNamespace: ingress-nginx
+    monitoringNamespace: monitoring
+
+defaults:
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { memory: 256Mi }
+  hpa:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPU: 70
+  pdb:
+    enabled: false
+    minAvailable: 1
+
+ingress:
+  enabled: true
+  className: nginx
+  host: shop.example.com
+  service: frontend-proxy
+  port: 8080
+  tls:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+
+# ---------------------------------------------------------------------------
+# Services. Ports match deployment/services/*.yaml.
+#   talksTo:  services this one is allowed to call (drives NetworkPolicy egress)
+#   secrets:  keys pulled from Vault into a k8s Secret, mounted as env vars
+#   tmp:      mount an emptyDir at /tmp (needed with a read-only root fs)
+# ---------------------------------------------------------------------------
+services:
+  frontend-proxy:
+    port: 8080
+    ingress: true
+    talksTo: [frontend, image-provider, flagd-ui, load-generator]
+    tmp: true
+
+  frontend:
+    port: 8080
+    talksTo: [ad, cart, checkout, currency, product-catalog, quote, recommendation, shipping]
+    tmp: true
+    env:
+      PORT: "8080"
+
+  ad:
+    port: 9555
+    talksTo: []
+    tmp: true
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits:   { memory: 512Mi }
+
+  cart:
+    port: 7070
+    talksTo: [valkey-cart]
+    env:
+      VALKEY_ADDR: valkey-cart:6379
+
+  checkout:
+    port: 5050
+    talksTo: [cart, currency, email, payment, product-catalog, shipping, kafka]
+
+  currency:
+    port: 7001
+
+  email:
+    port: 6060
+    tmp: true
+
+  payment:
+    port: 50051
+    secrets:
+      PAYMENT_API_KEY: payment/api_key
+
+  product-catalog:
+    port: 3550
+    talksTo: [postgres]
+    secrets:
+      DB_USERNAME: postgres/username
+      DB_PASSWORD: postgres/password
+
+  quote:
+    port: 8090
+    tmp: true
+
+  recommendation:
+    port: 9001
+    talksTo: [product-catalog]
+
+  shipping:
+    port: 50050
+    talksTo: [quote]
+
+  accounting:
+    port: 0               # Kafka consumer, no inbound port
+    talksTo: [kafka, postgres]
+    secrets:
+      DB_USERNAME: postgres/username
+      DB_PASSWORD: postgres/password
+
+  fraud-detection:
+    port: 0
+    talksTo: [kafka]
+    tmp: true
+
+  image-provider:
+    port: 8081
+    tmp: true
+
+  flagd-ui:
+    port: 4000
+    tmp: true
+
+  load-generator:
+    enabled: false        # off by default, on in dev only
+    port: 8089
+    talksTo: [frontend-proxy]
+    tmp: true

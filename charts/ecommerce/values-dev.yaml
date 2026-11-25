@@ -1,0 +1,10 @@
+environment: dev
+
+ingress:
+  host: shop.dev.example.com
+  tls:
+    clusterIssuer: letsencrypt-staging   # don't burn prod LE rate limits in dev
+
+services:
+  load-generator:
+    enabled: true
