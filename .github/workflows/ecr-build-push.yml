@@ -10,7 +10,7 @@ permissions:
   id-token: write   # lets the job get short-lived AWS credentials via OIDC
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REGION: ${{ vars.AWS_REGION  || 'us-west-1'}}
   REPO_PREFIX: ${{ vars.ECR_REPO_PREFIX || 'ecomerce' }}
 
 jobs:
@@ -57,7 +57,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Log in to ECR
         id: ecr
